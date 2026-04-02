@@ -238,16 +238,16 @@ def compute_mean_std_stream(
 # ----------------------------
 # 7) GPU-Resident SSL Dataset + Day Batch Sampler
 # ----------------------------
+GPU_VRAM_THRESHOLD_MB = 10_000
+
+
 class GPUResidentSSLDataset:
     """
-    Load per-day CSVs, normalize, concatenate into flat CPU tensors.
-    Each epoch iterates through ALL data. Batch construction via CPU indexing,
-    then async transfer to GPU via prefetch thread.
-
-    Storage on CPU:
-      all_X: (total_timesteps, F) float32
-      all_w: (total_timesteps,) float32
-      day_offsets: (num_days+1,) int64
+    Load per-day CSVs, normalize, concatenate into flat tensors.
+    Supports two modes controlled by `gpu_resident`:
+      - gpu_resident=True:  store data on GPU, batch construction via GPU indexing (fast)
+      - gpu_resident=False: store data on CPU, batch construction via CPU indexing,
+                            async transfer to GPU via prefetch thread in training loop
     """
 
     def __init__(
@@ -261,9 +261,11 @@ class GPUResidentSSLDataset:
         feature_std: np.ndarray,
         device: torch.device,
         include_open_period: bool = True,
+        gpu_resident: bool = True,
     ):
         self.seq_len = int(seq_len)
         self.device = device
+        self.gpu_resident = gpu_resident
         self.n_features = len(feature_cols)
 
         fm = feature_mean.astype(np.float32)
@@ -332,32 +334,23 @@ class GPUResidentSSLDataset:
         self.num_samples = len(index_flat_np)
         self.num_days = num_days
 
-        self.all_X = torch.from_numpy(all_X_np)
-        self.all_w = torch.from_numpy(all_w_np)
-        self.day_offsets = torch.from_numpy(day_offsets_np)
-        self.index_flat = torch.from_numpy(index_flat_np)
-        self.index_day = torch.from_numpy(index_day_np)
+        storage_device = device if gpu_resident else torch.device("cpu")
+        self.all_X = torch.from_numpy(all_X_np).to(storage_device)
+        self.all_w = torch.from_numpy(all_w_np).to(storage_device)
+        self.day_offsets = torch.from_numpy(day_offsets_np).to(storage_device)
+        self.index_flat = torch.from_numpy(index_flat_np).to(storage_device)
+        self.index_day = torch.from_numpy(index_day_np).to(storage_device)
 
-        self._offsets = torch.arange(seq_len, dtype=torch.int64)
+        self._offsets = torch.arange(seq_len, device=storage_device, dtype=torch.int64)
 
         del all_X_np, all_w_np, index_flat_np, index_day_np
-
-        self.day_to_sample_indices: Dict[int, List[int]] = {}
-        cursor = 0
-        for di in range(num_days):
-            length = int(day_lengths_np[di])
-            valid_length = max(0, length - min_start)
-            if valid_length > 0:
-                self.day_to_sample_indices[di] = list(
-                    range(cursor, cursor + valid_length)
-                )
-                cursor += valid_length
 
         # Pre-compute pad_lens on CPU (numpy) — no GPU→CPU sync needed in training loop
         day_starts_repeated = np.repeat(
             day_offsets_np[:-1], np.maximum(0, day_lengths_np - min_start)
         )
-        t_in_day_np = self.index_flat.numpy() - day_starts_repeated
+        index_flat_cpu = self.index_flat.cpu() if gpu_resident else self.index_flat
+        t_in_day_np = index_flat_cpu.numpy() - day_starts_repeated
         self.pad_lens_np = np.maximum(0, seq_len - 1 - t_in_day_np).astype(np.int32)
         del day_starts_repeated, t_in_day_np
 
@@ -369,15 +362,16 @@ class GPUResidentSSLDataset:
         self, sample_indices: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Fetch a batch via CPU vectorized indexing. Returns CPU pinned tensors
-        ready for async transfer to GPU.
+        Fetch a batch via vectorized indexing.
+        - gpu_resident=True:  indices and data on GPU, returns GPU tensors
+        - gpu_resident=False: indices and data on CPU, returns CPU tensors
 
         Returns:
-            x_batch: (B, seq_len, F) float32, left-padded with 0, CPU pinned
-            w_batch: (B, seq_len) float32, left-padded with 0, CPU pinned
-            pad_mask: (B, seq_len) bool, True = padded position, CPU
+            x_batch: (B, seq_len, F) float32, left-padded with 0
+            w_batch: (B, seq_len) float32, left-padded with 0
+            pad_mask: (B, seq_len) bool, True = padded position
         """
-        if sample_indices.device.type != "cpu":
+        if not self.gpu_resident and sample_indices.device.type != "cpu":
             sample_indices = sample_indices.cpu()
 
         B = sample_indices.shape[0]
@@ -407,45 +401,6 @@ class GPUResidentSSLDataset:
         w_batch = w_batch * (~pad_mask).float()
 
         return x_batch, w_batch, pad_mask
-
-
-class DayBatchSampler:
-    """Yield sample indices grouped by day, time-ordered within each day."""
-
-    def __init__(
-        self,
-        dataset: GPUResidentSSLDataset,
-        batch_size: int,
-        shuffle_days: bool,
-        seed: int,
-    ):
-        self.batch_size = int(batch_size)
-        self.shuffle_days = bool(shuffle_days)
-        self.seed = int(seed)
-        self.epoch = 0
-        self.days = sorted(dataset.day_to_sample_indices.keys())
-        self.day_to_indices = dataset.day_to_sample_indices
-
-    def set_epoch(self, epoch: int):
-        self.epoch = epoch
-
-    def __iter__(self):
-        days = self.days[:]
-        if self.shuffle_days:
-            rng = random.Random(self.seed + self.epoch)
-            rng.shuffle(days)
-        for day_i in days:
-            idxs = self.day_to_indices[day_i]
-            for j in range(0, len(idxs), self.batch_size):
-                yield idxs[j : j + self.batch_size]
-
-    def __len__(self):
-        n = 0
-        for day_i in self.days:
-            n += (
-                len(self.day_to_indices[day_i]) + self.batch_size - 1
-            ) // self.batch_size
-        return n
 
 
 # ----------------------------
@@ -966,8 +921,14 @@ def ssl_pretrain_worker(task: Dict) -> Dict:
         np.savez(MEAN_STD_CACHE, **existing)
         _log(f"mean/std cached to {MEAN_STD_CACHE}")
 
-    # Build GPU-resident dataset (all data on GPU)
-    _log(f"Building GPU-resident SSL dataset from {len(train_files)} files...")
+    # Decide GPU-resident vs CPU+prefetch based on VRAM
+    gpu_resident = True
+    if device.type == "cuda":
+        total_vram_mb = torch.cuda.get_device_properties(device).total_mem / 1024 / 1024
+        gpu_resident = total_vram_mb >= GPU_VRAM_THRESHOLD_MB
+        _log(f"[VRAM] {total_vram_mb:.0f}MB total -> {'GPU-resident' if gpu_resident else 'CPU+prefetch'}")
+
+    _log(f"Building SSL dataset from {len(train_files)} files (gpu_resident={gpu_resident})...")
     train_ds = GPUResidentSSLDataset(
         file_paths=train_files,
         seq_len=seq_len,
@@ -978,9 +939,7 @@ def ssl_pretrain_worker(task: Dict) -> Dict:
         feature_std=feature_std,
         device=device,
         include_open_period=INCLUDE_OPEN_PERIOD,
-    )
-    train_sampler = DayBatchSampler(
-        train_ds, SSL_BATCH_SIZE, shuffle_days=True, seed=seed * 1000003 + 17,
+        gpu_resident=gpu_resident,
     )
     gpu_mem_mb = (
         torch.cuda.memory_allocated(device) / 1024 / 1024
@@ -989,7 +948,7 @@ def ssl_pretrain_worker(task: Dict) -> Dict:
     )
     n_batches = (len(train_ds) + SSL_BATCH_SIZE - 1) // SSL_BATCH_SIZE
     _log(
-        f"CPU-resident dataset: {len(train_ds)} samples, {train_ds.num_days} days, "
+        f"Dataset: {len(train_ds)} samples, {train_ds.num_days} days, "
         f"~{n_batches} batches/epoch (bs={SSL_BATCH_SIZE}), GPU_mem={gpu_mem_mb:.0f}MB"
     )
 
@@ -1089,6 +1048,37 @@ def ssl_pretrain_worker(task: Dict) -> Dict:
         _log(f"[SKIP] Already finished (start_ep={start_ep} > {SSL_MAX_EPOCHS})")
         return {"fold_name": fold_name, "seed": seed, "status": "skipped"}
 
+    # --- shared forward/backward step (avoids duplicating for both paths) ---
+    def _train_step(x, w, pad_mask, time_mask):
+        opt.zero_grad(set_to_none=True)
+        if use_scaler:
+            with _autocast_ctx(True, device, AMP_DTYPE):
+                recon, _ = ssl_forward_recon_revin(
+                    model, x, padding_mask=pad_mask, time_mask=time_mask
+                )
+                loss_total = ssl_loss_huber_with_delta_weighted(
+                    recon_x=recon, x_true=x, time_mask=time_mask,
+                    w=w, delta_lambda=SSL_DELTA_LAMBDA, padding_mask=pad_mask,
+                )
+            scaler.scale(loss_total).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            with _autocast_ctx(SSL_USE_AMP, device, AMP_DTYPE):
+                recon, _ = ssl_forward_recon_revin(
+                    model, x, padding_mask=pad_mask, time_mask=time_mask
+                )
+                loss_total = ssl_loss_huber_with_delta_weighted(
+                    recon_x=recon, x_true=x, time_mask=time_mask,
+                    w=w, delta_lambda=SSL_DELTA_LAMBDA, padding_mask=pad_mask,
+                )
+            loss_total.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+        return loss_total.detach()
+
     # Training loop — each epoch iterates through ALL data
     for ep in range(start_ep, SSL_MAX_EPOCHS + 1):
         current_lr = get_cosine_lr(ep)
@@ -1099,113 +1089,110 @@ def ssl_pretrain_worker(task: Dict) -> Dict:
 
         model.train()
 
-        # Flat shuffle: generate perm on GPU (preserves exact RNG sequence), then move to CPU
+        # Flat shuffle: generate perm on GPU (preserves exact RNG sequence)
         shuffle_gen = torch.Generator(device=device)
         shuffle_gen.manual_seed(seed * 7 + ep)
-        perm = torch.randperm(len(train_ds), device=device, generator=shuffle_gen).cpu()
-        perm_np = perm.numpy()
-        batch_indices_list = list(perm.split(SSL_BATCH_SIZE))
-        del perm
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        # --- Prefetch: prepare batches on CPU in a background thread ---
-        PREFETCH_DEPTH = 2
-        prefetch_queue: deque = deque()
-        prefetch_error: List[Optional[Exception]] = [None]
-        prefetch_done = threading.Event()
-
-        def _prefetch_worker():
-            try:
-                local_rng = np.random.RandomState(seed + ep * 1000003)
-                for bi, indices in enumerate(batch_indices_list):
-                    x, w, pad_mask = train_ds.get_batch(indices)
-                    B, L = x.shape[0], x.shape[1]
-                    start = bi * SSL_BATCH_SIZE
-                    batch_pad_lens = train_ds.pad_lens_np[perm_np[start : start + B]]
-                    time_mask_np = make_time_span_mask_fast(
-                        B=B, L=L,
-                        mask_ratio=SSL_MASK_RATIO,
-                        span_min=SSL_SPAN_MIN,
-                        span_max=SSL_SPAN_MAX,
-                        rng=local_rng,
-                        pad_lens=batch_pad_lens,
-                    )
-                    time_mask_cpu = torch.from_numpy(time_mask_np)
-                    x_gpu = x.pin_memory().to(device, non_blocking=True)
-                    w_gpu = w.pin_memory().to(device, non_blocking=True)
-                    pad_gpu = pad_mask.pin_memory().to(device, non_blocking=True)
-                    tm_gpu = time_mask_cpu.pin_memory().to(device, non_blocking=True)
-
-                    while len(prefetch_queue) >= PREFETCH_DEPTH:
-                        prefetch_done.wait(timeout=0.001)
-                        prefetch_done.clear()
-                    prefetch_queue.append((x_gpu, w_gpu, pad_gpu, tm_gpu))
-            except Exception as e:
-                prefetch_error[0] = e
-
-        prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
-        prefetch_thread.start()
+        perm_gpu = torch.randperm(len(train_ds), device=device, generator=shuffle_gen)
+        perm_cpu = perm_gpu.cpu()
+        perm_np = perm_cpu.numpy()
 
         running_loss = torch.zeros(1, device=device)
         nb = 0
-        n_batches = len(batch_indices_list)
 
-        for _batch_i in range(n_batches):
-            while len(prefetch_queue) == 0:
-                if prefetch_error[0] is not None:
-                    raise prefetch_error[0]
-                prefetch_done.wait(timeout=0.001)
-                prefetch_done.clear()
-            x, w, pad_mask, time_mask = prefetch_queue.popleft()
-            prefetch_done.set()
+        if gpu_resident:
+            # ============ PATH A: GPU-resident (original fast path) ============
+            batch_indices_list = list(perm_gpu.split(SSL_BATCH_SIZE))
+            del perm_gpu, perm_cpu
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-            torch.cuda.current_stream(device).synchronize()
+            rng = np.random.RandomState(seed + ep * 1000003)
 
-            opt.zero_grad(set_to_none=True)
+            for batch_i, indices in enumerate(batch_indices_list):
+                x, w, pad_mask = train_ds.get_batch(indices)
+                B, L, _F = x.shape
 
-            if use_scaler:
-                with _autocast_ctx(True, device, AMP_DTYPE):
-                    recon, _ = ssl_forward_recon_revin(
-                        model, x, padding_mask=pad_mask, time_mask=time_mask
-                    )
-                    loss_total = ssl_loss_huber_with_delta_weighted(
-                        recon_x=recon,
-                        x_true=x,
-                        time_mask=time_mask,
-                        w=w,
-                        delta_lambda=SSL_DELTA_LAMBDA,
-                        padding_mask=pad_mask,
-                    )
-                scaler.scale(loss_total).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                with _autocast_ctx(SSL_USE_AMP, device, AMP_DTYPE):
-                    recon, _ = ssl_forward_recon_revin(
-                        model, x, padding_mask=pad_mask, time_mask=time_mask
-                    )
-                    loss_total = ssl_loss_huber_with_delta_weighted(
-                        recon_x=recon,
-                        x_true=x,
-                        time_mask=time_mask,
-                        w=w,
-                        delta_lambda=SSL_DELTA_LAMBDA,
-                        padding_mask=pad_mask,
-                    )
-                loss_total.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                opt.step()
+                start = batch_i * SSL_BATCH_SIZE
+                batch_pad_lens = train_ds.pad_lens_np[perm_np[start : start + B]]
+                time_mask_np = make_time_span_mask_fast(
+                    B=B, L=L,
+                    mask_ratio=SSL_MASK_RATIO,
+                    span_min=SSL_SPAN_MIN,
+                    span_max=SSL_SPAN_MAX,
+                    rng=rng,
+                    pad_lens=batch_pad_lens,
+                )
+                time_mask = torch.from_numpy(time_mask_np).to(device, non_blocking=True)
 
-            running_loss += loss_total.detach()
-            nb += 1
+                running_loss += _train_step(x, w, pad_mask, time_mask)
+                nb += 1
 
-        prefetch_thread.join()
-        if prefetch_error[0] is not None:
-            raise prefetch_error[0]
-        del batch_indices_list, perm_np
+            del batch_indices_list
+
+        else:
+            # ============ PATH B: CPU + prefetch (low-VRAM path) ============
+            batch_indices_list = list(perm_cpu.split(SSL_BATCH_SIZE))
+            del perm_gpu, perm_cpu
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            PREFETCH_DEPTH = 2
+            prefetch_queue: deque = deque()
+            prefetch_error: List[Optional[Exception]] = [None]
+            prefetch_done = threading.Event()
+
+            def _prefetch_worker():
+                try:
+                    local_rng = np.random.RandomState(seed + ep * 1000003)
+                    for bi, indices in enumerate(batch_indices_list):
+                        x, w, pad_mask = train_ds.get_batch(indices)
+                        B, L = x.shape[0], x.shape[1]
+                        start = bi * SSL_BATCH_SIZE
+                        batch_pad_lens = train_ds.pad_lens_np[perm_np[start : start + B]]
+                        time_mask_np = make_time_span_mask_fast(
+                            B=B, L=L,
+                            mask_ratio=SSL_MASK_RATIO,
+                            span_min=SSL_SPAN_MIN,
+                            span_max=SSL_SPAN_MAX,
+                            rng=local_rng,
+                            pad_lens=batch_pad_lens,
+                        )
+                        time_mask_cpu = torch.from_numpy(time_mask_np)
+                        x_gpu = x.pin_memory().to(device, non_blocking=True)
+                        w_gpu = w.pin_memory().to(device, non_blocking=True)
+                        pad_gpu = pad_mask.pin_memory().to(device, non_blocking=True)
+                        tm_gpu = time_mask_cpu.pin_memory().to(device, non_blocking=True)
+
+                        while len(prefetch_queue) >= PREFETCH_DEPTH:
+                            prefetch_done.wait(timeout=0.001)
+                            prefetch_done.clear()
+                        prefetch_queue.append((x_gpu, w_gpu, pad_gpu, tm_gpu))
+                except Exception as e:
+                    prefetch_error[0] = e
+
+            prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
+            prefetch_thread.start()
+
+            n_batches = len(batch_indices_list)
+            for _batch_i in range(n_batches):
+                while len(prefetch_queue) == 0:
+                    if prefetch_error[0] is not None:
+                        raise prefetch_error[0]
+                    prefetch_done.wait(timeout=0.001)
+                    prefetch_done.clear()
+                x, w, pad_mask, time_mask = prefetch_queue.popleft()
+                prefetch_done.set()
+                torch.cuda.current_stream(device).synchronize()
+
+                running_loss += _train_step(x, w, pad_mask, time_mask)
+                nb += 1
+
+            prefetch_thread.join()
+            if prefetch_error[0] is not None:
+                raise prefetch_error[0]
+            del batch_indices_list
+
+        del perm_np
         train_loss = float(running_loss.item() / max(1, nb))
 
         _log(f"[{fold_name}][seed {seed}] ep={ep:03d} | loss={train_loss:.6f}")
