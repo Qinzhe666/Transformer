@@ -8,3 +8,4 @@ sft_posttrain_seqlen_ablation_v3/
 nohup.out
 CLAUDE.md
 .cursor/
+pt_data/

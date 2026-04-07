@@ -2,7 +2,7 @@
 # =========================
 # CELL: Multi-process post-train from SSL checkpoints (SEQ_LEN Ablation) - v3 GPU-Resident Data
 #   - discovers SSL checkpoints in ssl_ckpts_seqlen_ablation/seqlen_{sl}/
-#   - loops through SEQ_LENS_TO_RUN = [5, 10, 15, 20]
+#   - loops through SSL_EPOCHS_PER_SEQLEN keys
 #   - task = (fold_name, seed, ssl_epoch, seq_len)
 #   - each task runs SFT_EPOCHS=25
 #   - save epXXX.pt + last.pt + best.pt
@@ -41,25 +41,36 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 # ----------------------------
 # 0) CONFIG (edit here)
 # ----------------------------
-SEEDS_TO_RUN = [0]
+SEEDS_TO_RUN = [0, 1, 2, 3]
 
 SSL_MANIFEST_DIR = "./ssl_ckpts_seqlen_ablation"
 DATA_GLOB = "/home/ql84/Transformer/csv_data/**/*.csv"
+PT_DATA_DIR = "./pt_data"
 SFT_OUT_DIR = "./sft_posttrain_seqlen_ablation_v3"
 
-# SEQ_LEN ablation v3: per-seq_len SSL epoch lists
-SEQ_LENS_TO_RUN = [5, 10]
+# SSL epochs to run - per-seq_len mapping
+SSL_EPOCHS_PER_SEQLEN = {
+    3: [50],
+    5: [50],
+    8: [50],
+    10: [50],
+    20: [50],
+    30: [50],
+}
 
 # Only run specific folds (matching SSL pretrain)
 FOLD_FILTER = [
+    # "Fold_2015-2021_train_SSL",
+    # "Fold_2015-2022_train_SSL",
     "Fold_2015-2023_train_SSL",
+    "Fold_2015-2024_train_SSL",
 ]
 GPU_IDS = [0]
 N_WORKERS = 1
 CPU_THREADS_PER_WORKER = 1
 
 # post-train
-SFT_EPOCHS = 25
+SFT_EPOCHS = 30
 SFT_BATCH_SIZE = 4096
 SFT_LR = 3e-5
 SFT_WEIGHT_DECAY = 1e-2
@@ -74,7 +85,17 @@ EXCLUDE_COLS_EXTRA = ["Unnamed: 0", "Y0", "Y2", "Y3", WGT_COL]
 # Categorical features to EXCLUDE from continuous features (but not used otherwise)
 CAT_FEATURE_COLS = ["X0", "X1", "X2", "X3"]
 
-SEQ_LEN = 30  # default for module-level code; overridden per-task by SEQ_LENS_TO_RUN
+_ALL_COLS = [
+    "Unnamed: 0",
+    "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9",
+    "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18", "X19",
+    "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28", "X29",
+    "X30", "X31", "X32", "X33", "X34", "X35", "X36", "X37", "X38", "X39",
+    "X40", "X41", "X42", "X43", "X44", "X45", "X46", "X47", "X48", "X49",
+    "X50", "X51", "X52", "X53",
+    "Y0", "Y1", "Y2", "Y3", "wgt",
+]
+
 DROP_LAST_N = 0
 
 # Include first 30 minutes (left-pad incomplete sequences with padding mask)
@@ -85,13 +106,6 @@ USE_TORCH_COMPILE = False
 # AMP
 SFT_USE_AMP = True
 AMP_DTYPE = "bf16"
-
-# SSL epochs to run - per-seq_len mapping (12 groups x 2 seeds = 24 tasks)
-SSL_EPOCHS_PER_SEQLEN = {
-    5: [10, 30, 50],
-    10: [10, 30, 50],
-}
-SSL_EPOCHS_TO_RUN = [10, 30, 50]
 
 # RevIN config (must match SSL pretrain)
 USE_REVIN = True
@@ -222,21 +236,22 @@ def parse_end_year_from_fold_name(fold_name: str) -> int:
 # ----------------------------
 # 6) Load all data file list + infer feature columns
 # ----------------------------
+pt_year_files = sorted(glob.glob(os.path.join(PT_DATA_DIR, "year_*.pt")))
 all_files = sorted(glob.glob(DATA_GLOB, recursive=True))
-if len(all_files) == 0:
-    raise RuntimeError(f"No csv found under {DATA_GLOB}")
-master_log(f"Total csv files: {len(all_files)}")
-master_log(f"Example files: {all_files[:3]}")
 
-sample_df = pd.read_csv(all_files[0], nrows=5)
-all_cols = sample_df.columns.tolist()
-for c in TARGET_COLS:
-    if c not in all_cols:
-        raise RuntimeError(f"Missing target col {c} in CSV columns")
-if WGT_COL not in all_cols:
-    raise RuntimeError(f"Missing weight col {WGT_COL} in CSV columns")
+if pt_year_files:
+    master_log(f"Using pt_data: {len(pt_year_files)} year files")
+elif all_files:
+    master_log(f"Using CSV data: {len(all_files)} files")
+else:
+    raise RuntimeError(f"No .pt files in {PT_DATA_DIR} and no csv under {DATA_GLOB}")
 
-# Exclude categorical features from continuous features
+if all_files:
+    sample_df = pd.read_csv(all_files[0], nrows=5)
+    all_cols = sample_df.columns.tolist()
+else:
+    all_cols = list(_ALL_COLS)
+
 exclude = set(TARGET_COLS + EXCLUDE_COLS_EXTRA + CAT_FEATURE_COLS)
 feature_cols = [c for c in all_cols if c not in exclude]
 feature_dim = len(feature_cols)
@@ -245,7 +260,13 @@ if feature_dim <= 0:
 master_log(f"feature_dim={feature_dim} (excluding categorical: {CAT_FEATURE_COLS})")
 master_log(f"Example features: {feature_cols[:10]}")
 
-available_years = sorted({file_year(f) for f in all_files})
+if all_files:
+    available_years = sorted({file_year(f) for f in all_files})
+else:
+    available_years = sorted(
+        int(os.path.basename(f).replace("year_", "").replace(".pt", ""))
+        for f in pt_year_files
+    )
 master_log(
     f"available years: {available_years[0]}..{available_years[-1]} (n={len(available_years)})"
 )
@@ -298,88 +319,124 @@ def compute_mean_std_stream(
 
 
 # ----------------------------
-# 8) GPU-Resident Dataset + Day Batch Sampler
+# 8) Fast .pt loader + GPU-Resident Dataset
 #    Stores flat tensors on GPU, vectorized batch construction.
 # ----------------------------
-class GPUResidentDataset:
+
+
+def _load_data_for_years(
+    years: List[int],
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    file_paths: Optional[List[str]] = None,
+    feature_cols: Optional[List[str]] = None,
+    wgt_col: str = "wgt",
+    drop_last_n: int = 0,
+    pt_data_dir: str = PT_DATA_DIR,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load per-day CSVs, normalize, concatenate into flat GPU tensors.
-    Batch construction is done entirely on GPU via vectorized indexing.
-
-    Storage on GPU:
-      all_X: (total_timesteps, F) float32
-      all_y: (total_timesteps,) float32
-      all_w: (total_timesteps,) float32
-      day_offsets: (num_days+1,) int64  — cumulative sum of day lengths
-      index_flat: (N,) int64  — flat position in all_X for each sample
-      index_day:  (N,) int64  — day index for each sample
+    Load X, W, Y1, day_lengths for the given years.
+    Tries .pt files first; falls back to CSV if any year is missing.
+    Returns NORMALIZED X, cleaned W and Y1, and day_lengths (all numpy).
     """
+    fm = feature_mean.astype(np.float32)
+    fs = feature_std.astype(np.float32)
+    fs = np.where(fs == 0, 1.0, fs).astype(np.float32)
 
-    def __init__(
-        self,
-        file_paths: List[str],
-        seq_len: int,
-        drop_last_n: int,
-        feature_cols: List[str],
-        target_col: str,
-        wgt_col: str,
-        feature_mean: np.ndarray,
-        feature_std: np.ndarray,
-        device: torch.device,
-    ):
-        self.seq_len = int(seq_len)
-        self.device = device
+    pt_paths = {y: os.path.join(pt_data_dir, f"year_{y}.pt") for y in years}
+    use_pt = all(os.path.exists(p) for p in pt_paths.values())
 
-        fm = feature_mean.astype(np.float32)
-        fs = feature_std.astype(np.float32)
-        fs = np.where(fs == 0, 1.0, fs).astype(np.float32)
-
-        # Step 1: Load all CSVs into numpy lists
-        all_X_list = []
-        all_y_list = []
-        all_w_list = []
-        day_lengths = []
-
-        usecols = list(feature_cols) + [target_col, wgt_col]
+    if use_pt:
+        all_X_parts, all_w_parts, all_y_parts, all_dl_parts = [], [], [], []
+        for y in sorted(years):
+            data = torch.load(pt_paths[y], map_location="cpu", weights_only=True)
+            all_X_parts.append(data["X"].numpy())
+            all_w_parts.append(data["W"].numpy())
+            all_y_parts.append(data["Y1"].numpy())
+            all_dl_parts.append(data["day_lengths"].numpy())
+            del data
+        all_X_np = np.concatenate(all_X_parts, axis=0)
+        all_y_np = np.concatenate(all_y_parts, axis=0)
+        all_w_np = np.concatenate(all_w_parts, axis=0)
+        day_lengths_np = np.concatenate(all_dl_parts, axis=0)
+        del all_X_parts, all_w_parts, all_y_parts, all_dl_parts
+        all_X_np = (all_X_np - fm) / fs
+    else:
+        if file_paths is None or feature_cols is None:
+            raise RuntimeError("No .pt files found and no CSV file_paths/feature_cols provided")
+        all_X_list, all_y_list, all_w_list = [], [], []
+        day_lengths_list: List[int] = []
+        usecols = list(feature_cols) + ["Y1", wgt_col]
         for p in file_paths:
             df = pd.read_csv(p, usecols=usecols)
             if drop_last_n > 0:
                 df = df.iloc[:-drop_last_n]
             if len(df) == 0:
                 continue
-
             w = df[wgt_col].to_numpy(dtype=np.float32, copy=True)
             w = np.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
             w = np.clip(w, 0.0, None)
-
-            y = df[target_col].to_numpy(dtype=np.float32, copy=True)
+            y = df["Y1"].to_numpy(dtype=np.float32, copy=True)
             y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-
             X = df[feature_cols].to_numpy(dtype=np.float32, copy=True)
             X = (X - fm) / fs
-
-            T = X.shape[0]
-            if T == 0:
+            if X.shape[0] == 0:
                 continue
-
             all_X_list.append(X)
             all_y_list.append(y)
             all_w_list.append(w)
-            day_lengths.append(T)
-
-        if len(day_lengths) == 0:
-            raise RuntimeError("GPUResidentDataset: no valid data.")
-
-        # Step 2: Concatenate into flat numpy arrays
-        all_X_np = np.concatenate(all_X_list, axis=0)  # (total, F)
-        all_y_np = np.concatenate(all_y_list, axis=0)  # (total,)
-        all_w_np = np.concatenate(all_w_list, axis=0)  # (total,)
-        day_lengths_np = np.array(day_lengths, dtype=np.int64)
-
-        # Free numpy lists
+            day_lengths_list.append(X.shape[0])
+        if len(day_lengths_list) == 0:
+            raise RuntimeError("No valid data found in CSV files")
+        all_X_np = np.concatenate(all_X_list, axis=0)
+        all_y_np = np.concatenate(all_y_list, axis=0)
+        all_w_np = np.concatenate(all_w_list, axis=0)
+        day_lengths_np = np.array(day_lengths_list, dtype=np.int64)
         del all_X_list, all_y_list, all_w_list
 
-        total_timesteps = all_X_np.shape[0]
+    return all_X_np, all_w_np, all_y_np, day_lengths_np
+
+
+class GPUResidentDataset:
+    """
+    Load data from .pt files (fast) or CSVs (fallback), normalize,
+    concatenate into flat GPU tensors.
+    Batch construction is done entirely on GPU via vectorized indexing.
+
+    Storage on GPU:
+      all_X: (total_timesteps, F) float32
+      all_y: (total_timesteps,) float32
+      all_w: (total_timesteps,) float32
+      day_offsets: (num_days+1,) int64
+      index_flat: (N,) int64
+      index_day:  (N,) int64
+    """
+
+    def __init__(
+        self,
+        data_years: List[int],
+        seq_len: int,
+        feature_mean: np.ndarray,
+        feature_std: np.ndarray,
+        device: torch.device,
+        file_paths: Optional[List[str]] = None,
+        feature_cols: Optional[List[str]] = None,
+        wgt_col: str = "wgt",
+        drop_last_n: int = 0,
+    ):
+        self.seq_len = int(seq_len)
+        self.device = device
+
+        all_X_np, all_w_np, all_y_np, day_lengths_np = _load_data_for_years(
+            years=data_years,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            file_paths=file_paths,
+            feature_cols=feature_cols,
+            wgt_col=wgt_col,
+            drop_last_n=drop_last_n,
+        )
+
         num_days = len(day_lengths_np)
 
         # Step 3: Build sample index arrays (on CPU first)
@@ -404,8 +461,8 @@ class GPUResidentDataset:
         self.num_samples = len(index_flat_np)
         self.num_days = num_days
 
-        # Step 4: Move everything to GPU
-        self.all_X = torch.from_numpy(all_X_np).to(device)
+        # Step 4: Move everything to GPU (all_X stored as float16 to save ~50% VRAM)
+        self.all_X = torch.from_numpy(all_X_np).to(device=device, dtype=torch.float16)
         self.all_y = torch.from_numpy(all_y_np).to(device)
         self.all_w = torch.from_numpy(all_w_np).to(device)
         self.day_offsets = torch.from_numpy(day_offsets_np).to(device)
@@ -476,8 +533,8 @@ class GPUResidentDataset:
             max=flat_positions.unsqueeze(1),
         )
 
-        # Fetch data from flat tensors
-        x_batch = self.all_X[gather_idx]  # (B, L, F)
+        # Fetch data from flat tensors (kept as float16; autocast handles promotion)
+        x_batch = self.all_X[gather_idx]  # (B, L, F) float16
         y_batch = self.all_y[flat_positions]  # (B,)
         w_batch = self.all_w[flat_positions]  # (B,)
 
@@ -489,7 +546,7 @@ class GPUResidentDataset:
         pad_mask = self._offsets.unsqueeze(0) < pad_len.unsqueeze(1)  # (B, L)
 
         # Zero out padded positions in x_batch
-        x_batch = x_batch * (~pad_mask).unsqueeze(-1).float()
+        x_batch = x_batch * (~pad_mask).unsqueeze(-1)
 
         return x_batch, y_batch, w_batch, pad_mask, day_ids, t_in_day
 
@@ -835,9 +892,14 @@ def load_ssl_into_model_trainonly_revin_scale(
 # ----------------------------
 # 13) Fold data builder
 # ----------------------------
+MEAN_STD_CACHE = "mean_std_cache.npz"
+
+
 @dataclass
 class FoldData:
     fold_name: str
+    train_years: List[int]
+    eval_years: List[int]
     train_files: List[str]
     eval_files: List[str]
     feature_mean: np.ndarray
@@ -853,8 +915,8 @@ def build_fold_data_from_foldname(fold_name: str) -> FoldData:
     if (end_year + 1) in available_years:
         eval_years.append(end_year + 1)
 
-    train_files = split_files_by_years(all_files, train_years)
-    eval_files = split_files_by_years(all_files, eval_years) if eval_years else []
+    train_files = split_files_by_years(all_files, train_years) if all_files else []
+    eval_files = split_files_by_years(all_files, eval_years) if all_files and eval_years else []
 
     if not eval_files:
         master_log(
@@ -865,10 +927,28 @@ def build_fold_data_from_foldname(fold_name: str) -> FoldData:
         train_files = train_files[: int(SMOKE_TEST_LIMIT_FILES)]
         eval_files = eval_files[: int(SMOKE_TEST_LIMIT_FILES)]
 
-    fm, fs = compute_mean_std_stream(train_files, feature_cols, drop_last_n=DROP_LAST_N)
+    cache_key_mean = f"{fold_name}_mean"
+    cache_key_std = f"{fold_name}_std"
+    cached = None
+    if os.path.exists(MEAN_STD_CACHE):
+        try:
+            cached = np.load(MEAN_STD_CACHE)
+        except Exception:
+            cached = None
+    if cached is not None and cache_key_mean in cached and cache_key_std in cached:
+        fm = cached[cache_key_mean]
+        fs = cached[cache_key_std]
+    else:
+        fm, fs = compute_mean_std_stream(train_files, feature_cols, drop_last_n=DROP_LAST_N)
+        existing = dict(np.load(MEAN_STD_CACHE)) if os.path.exists(MEAN_STD_CACHE) else {}
+        existing[cache_key_mean] = fm
+        existing[cache_key_std] = fs
+        np.savez(MEAN_STD_CACHE, **existing)
 
     return FoldData(
         fold_name=fold_name,
+        train_years=train_years,
+        eval_years=eval_years,
         train_files=train_files,
         eval_files=eval_files,
         feature_mean=fm,
@@ -981,31 +1061,39 @@ def run_posttrain_one_task(
 
     ds_cache_key = f"{fold_name}_sl{seq_len}"
     if ds_cache_key not in dataset_cache:
+        # Evict stale cache entries to free GPU memory before loading new data
+        for old_key in list(dataset_cache.keys()):
+            if old_key != ds_cache_key:
+                _log(f"[DATASET CACHE EVICT] {old_key}")
+                del dataset_cache[old_key]
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         _log(
-            "[DATASET BUILD] loading CSVs → GPU tensors (GPU-resident, no categorical) ..."
+            f"[DATASET BUILD] loading data → GPU tensors (train_years={fd.train_years}) ..."
         )
         train_ds = GPUResidentDataset(
-            fd.train_files,
-            seq_len,
-            DROP_LAST_N,
-            feature_cols=feature_cols,
-            target_col="Y1",
-            wgt_col=WGT_COL,
+            data_years=fd.train_years,
+            seq_len=seq_len,
             feature_mean=fd.feature_mean,
             feature_std=fd.feature_std,
             device=device,
+            file_paths=fd.train_files,
+            feature_cols=feature_cols,
+            wgt_col=WGT_COL,
+            drop_last_n=DROP_LAST_N,
         )
-        if fd.eval_files:
+        if fd.eval_years:
             eval_ds = GPUResidentDataset(
-                fd.eval_files,
-                seq_len,
-                DROP_LAST_N,
-                feature_cols=feature_cols,
-                target_col="Y1",
-                wgt_col=WGT_COL,
+                data_years=fd.eval_years,
+                seq_len=seq_len,
                 feature_mean=fd.feature_mean,
                 feature_std=fd.feature_std,
                 device=device,
+                file_paths=fd.eval_files,
+                feature_cols=feature_cols,
+                wgt_col=WGT_COL,
+                drop_last_n=DROP_LAST_N,
             )
         else:
             eval_ds = None
@@ -1304,9 +1392,9 @@ def load_tasks(seeds: List[int]) -> List[Task]:
             for y in [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
         ]
 
-    for seq_len in SEQ_LENS_TO_RUN:
+    for seq_len in SSL_EPOCHS_PER_SEQLEN:
         ssl_ckpt_dir = os.path.join(SSL_MANIFEST_DIR, f"seqlen_{seq_len}")
-        ssl_epochs_for_sl = SSL_EPOCHS_PER_SEQLEN.get(seq_len, SSL_EPOCHS_TO_RUN)
+        ssl_epochs_for_sl = SSL_EPOCHS_PER_SEQLEN[seq_len]
         for seed in seeds:
             for fold_name in folds_to_process:
                 for ssl_ep in ssl_epochs_for_sl:
@@ -1363,7 +1451,7 @@ def load_tasks(seeds: List[int]) -> List[Task]:
 
     master_log("=" * 70)
     master_log(
-        f"Task Status Summary (seeds={seeds}, seq_lens={SEQ_LENS_TO_RUN}) [SEQ_LEN Ablation Post-train v3 GPU-Resident]"
+        f"Task Status Summary (seeds={seeds}, seq_lens={list(SSL_EPOCHS_PER_SEQLEN)}) [SEQ_LEN Ablation Post-train v3 GPU-Resident]"
     )
     master_log("=" * 70)
     master_log(f"Total tasks discovered: {len(all_tasks)}")
@@ -1558,11 +1646,11 @@ def run_all_tasks_multiprocess_pool(tasks: List[Task]):
 def main():
     tasks = load_tasks(SEEDS_TO_RUN)
     master_log(f"Discovered tasks: {len(tasks)} (seeds={SEEDS_TO_RUN})")
-    master_log(f"SSL_EPOCHS_TO_RUN={SSL_EPOCHS_TO_RUN}")
+    master_log(f"SSL_EPOCHS_PER_SEQLEN={SSL_EPOCHS_PER_SEQLEN}")
     master_log(f"Example tasks: {tasks[:3]}")
 
     master_log(
-        f"RUN: seeds={SEEDS_TO_RUN} seq_lens={SEQ_LENS_TO_RUN} GPUs={GPU_IDS} workers={N_WORKERS} cpu_threads/worker={CPU_THREADS_PER_WORKER}"
+        f"RUN: seeds={SEEDS_TO_RUN} seq_lens={list(SSL_EPOCHS_PER_SEQLEN)} GPUs={GPU_IDS} workers={N_WORKERS} cpu_threads/worker={CPU_THREADS_PER_WORKER}"
     )
     master_log(
         f"SFT_EPOCHS={SFT_EPOCHS} SFT_BS={SFT_BATCH_SIZE} AMP={SFT_USE_AMP}/{AMP_DTYPE} compile={USE_TORCH_COMPILE}"
