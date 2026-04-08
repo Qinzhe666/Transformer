@@ -39,22 +39,22 @@ import torch.nn as nn
 # 0) CONFIG
 # ----------------------------
 # Train Fold_2015-2025 only
-SEEDS = [0]
-GPU_IDS = [0]
+SEEDS = [0, 1, 2, 3]
+GPU_IDS = [0, 1, 2]
 N_WORKERS = 1
 
 FOLD_FILTER = [
-    # "Fold_2015-2021_train_SSL",
-    # "Fold_2015-2022_train_SSL",
-    # "Fold_2015-2023_train_SSL",
-    "Fold_2015-2024_train_SSL",
+    "Fold_2015-2017_train_SSL",
+    "Fold_2015-2018_train_SSL",
+    "Fold_2015-2019_train_SSL",
+    "Fold_2015-2020_train_SSL",
 ]
 
 DATA_GLOB = "./csv_data/**/*.csv"
 SSL_SAVE_DIR_BASE = "./ssl_ckpts_seqlen_ablation"
 
 # SEQ_LEN ablation: train with different sequence lengths
-SEQ_LENS_TO_RUN = [20, 30]
+SEQ_LENS_TO_RUN = [3, 5, 8, 10, 15, 20, 25, 30]
 
 # SSL hyperparams
 SSL_MAX_EPOCHS = 50
@@ -388,8 +388,8 @@ class GPUResidentSSLDataset:
         self.num_samples = len(index_flat_np)
         self.num_days = num_days
 
-        self.all_X = torch.from_numpy(all_X_np).to(device=device, dtype=torch.bfloat16)
-        self.all_w = torch.from_numpy(all_w_np).to(device=device, dtype=torch.bfloat16)
+        self.all_X = torch.from_numpy(all_X_np).to(device=device, dtype=torch.float16)
+        self.all_w = torch.from_numpy(all_w_np).to(device=device, dtype=torch.float16)
         self.day_offsets = torch.from_numpy(day_offsets_np).to(device)
         self.index_flat = torch.from_numpy(index_flat_np).to(device)
         self.index_day = torch.from_numpy(index_day_np).to(device)
@@ -444,8 +444,8 @@ class GPUResidentSSLDataset:
         pad_len = (L - 1 - t_in_day).clamp(min=0)
         pad_mask = self._offsets.unsqueeze(0) < pad_len.unsqueeze(1)
 
-        x_batch = x_batch * (~pad_mask).unsqueeze(-1).float()
-        w_batch = w_batch * (~pad_mask).float()
+        x_batch = x_batch * (~pad_mask).unsqueeze(-1)
+        w_batch = w_batch * (~pad_mask)
 
         return x_batch, w_batch, pad_mask
 

@@ -463,8 +463,8 @@ class GPUResidentDataset:
 
         # Step 4: Move everything to GPU (all_X stored as float16 to save ~50% VRAM)
         self.all_X = torch.from_numpy(all_X_np).to(device=device, dtype=torch.float16)
-        self.all_y = torch.from_numpy(all_y_np).to(device)
-        self.all_w = torch.from_numpy(all_w_np).to(device)
+        self.all_y = torch.from_numpy(all_y_np).to(device=device, dtype=torch.float16)
+        self.all_w = torch.from_numpy(all_w_np).to(device=device, dtype=torch.float16)
         self.day_offsets = torch.from_numpy(day_offsets_np).to(device)
         self.index_flat = torch.from_numpy(index_flat_np).to(device)
         self.index_day = torch.from_numpy(index_day_np).to(device)
