@@ -9,3 +9,4 @@ nohup.out
 CLAUDE.md
 .cursor/
 pt_data/
+sft_*/
