@@ -1,12 +1,10 @@
+__pycache__/
 csv_data/
-PY_terms_csv.zip
-PY_terms_csv_new.zip
+zip_files/
 .venv/
-ssl_ckpts_seqlen_ablation/
-sft_posttrain_seqlen_ablation_v3/
-*_output.log
+ssl_*/
+sft_*/
 nohup.out
 CLAUDE.md
 .cursor/
 pt_data/
-sft_*/

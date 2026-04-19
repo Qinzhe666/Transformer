@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 
 # ----------------------------
-# Config (must match run_pretrain.py / run_posttrain.py)
+# Config (must match the run_pretrain_*/run_posttrain_* training scripts)
 # ----------------------------
 DATA_GLOB = "/home/ql84/Transformer/csv_data/**/*.csv"
 PT_DATA_DIR = "./pt_data"

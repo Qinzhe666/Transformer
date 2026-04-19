@@ -51,7 +51,7 @@ FOLD_FILTER = [
 ]
 
 DATA_GLOB = "./csv_data/**/*.csv"
-SSL_SAVE_DIR_BASE = "./ssl_ckpts_seqlen_ablation"
+SSL_SAVE_DIR_BASE = "./ssl_ckpts_v1"
 
 # SEQ_LEN ablation: train with different sequence lengths
 SEQ_LENS_TO_RUN = [3, 5, 8, 10, 15, 20, 25, 30]

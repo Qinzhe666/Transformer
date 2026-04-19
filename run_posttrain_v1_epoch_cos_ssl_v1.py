@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # =========================
-# SFT Post-train from SSL checkpoints — Step-based training (v4)
-#   - Training budget in gradient steps (SFT_TARGET_STEPS), not epochs
-#   - Eval + checkpoint every SFT_EVAL_EVERY_STEPS, saved as step{NNNNNN}.pt
-#   - Constant differential LR (encoder/revin vs head/gate), no scheduler
-#   - Discovers SSL checkpoints in ssl_ckpts_step_v2/seqlen_{sl}/
-#   - task = (fold_name, seed, ssl_step, seq_len)
-#   - Saves step{NNNNNN}.pt + last.pt + best.pt; resume from last.pt
+# CELL: Multi-process post-train from SSL checkpoints (SEQ_LEN Ablation) - v3 GPU-Resident Data
+#   - discovers SSL checkpoints in ssl_ckpts_v1/seqlen_{sl}/
+#   - loops through SSL_EPOCHS_PER_SEQLEN keys
+#   - task = (fold_name, seed, ssl_epoch, seq_len)
+#   - each task runs SFT_EPOCHS=25
+#   - save epXXX.pt + last.pt + best.pt
+#   - resume from last.pt
 #
 # **KEY FEATURES**:
 #   1. Log-transformed Scale for Multiplicative Gating
 #   2. BIG Transformer: d_model=128, nhead=4, num_layers=3, dim_feedforward=256
 #   3. NO categorical features (X0-X3 excluded, matching SSL pretrain)
 #   4. LEFT-PADDING + PADDING MASK for incomplete sequences
-#   5. Direct Huber Loss on pred vs target
+#   5. **SIMPLE Loss**: Direct Huber Loss on pred vs target (NO EMA, NO Z-Score)
 #   6. SEQ_LEN ablation: post-train with different sequence lengths matching SSL pretrain
-#   7. GPU-RESIDENT DATA: All data on GPU, vectorized batch construction
+#   7. **GPU-RESIDENT DATA**: All data stored on GPU as flat tensors, vectorized batch
+#      construction via GPU indexing. Eliminates CPU→GPU transfer bottleneck.
 # =========================
 
 import gc
@@ -35,48 +36,43 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # ----------------------------
 # 0) CONFIG (edit here)
 # ----------------------------
 SEEDS_TO_RUN = [0, 1, 2, 3]
 
-SSL_MANIFEST_DIR = "./ssl_ckpts_step_v2"
+SSL_MANIFEST_DIR = "./ssl_ckpts_v1"
 DATA_GLOB = "/home/ql84/Transformer/csv_data/**/*.csv"
 PT_DATA_DIR = "./pt_data"
-SFT_OUT_DIR = "./sft_posttrain_step_v2"
+SFT_OUT_DIR = "./sft_posttrain_v1"
 
-# SSL steps to use for SFT — per-seq_len mapping
-SSL_STEPS_PER_SEQLEN = {
-    3: [20_000, 50_000, 100_000],
-    5: [20_000, 50_000, 100_000],
-    8: [20_000, 50_000, 100_000],
-    10: [20_000, 50_000, 100_000],
-    20: [20_000, 50_000, 100_000],
-    30: [20_000, 50_000, 100_000],
+# SSL epochs to run - per-seq_len mapping
+SSL_EPOCHS_PER_SEQLEN = {
+    3: [50],
+    5: [50],
+    8: [50],
+    10: [50],
+    20: [50],
+    30: [50],
 }
 
 # Only run specific folds (matching SSL pretrain)
 FOLD_FILTER = [
-    "Fold_2015-2017_train_SSL",
-    "Fold_2015-2018_train_SSL",
-    "Fold_2015-2019_train_SSL",
-    "Fold_2015-2020_train_SSL",
-    "Fold_2015-2021_train_SSL",
-    "Fold_2015-2022_train_SSL",
+    # "Fold_2015-2021_train_SSL",
+    # "Fold_2015-2022_train_SSL",
     "Fold_2015-2023_train_SSL",
     "Fold_2015-2024_train_SSL",
 ]
-GPU_IDS = [0, 1, 2, 3]
-N_WORKERS = 12
+GPU_IDS = [0]
+N_WORKERS = 1
 CPU_THREADS_PER_WORKER = 1
 
-# post-train — budget in gradient steps (not epochs)
-SFT_TARGET_STEPS = 50_000
-SFT_EVAL_EVERY_STEPS = 5_000
+# post-train
+SFT_EPOCHS = 30
 SFT_BATCH_SIZE = 4096
-SFT_LR_ENCODER = 5e-6
-SFT_LR_HEAD = 1.5e-5
+SFT_LR = 3e-5
 SFT_WEIGHT_DECAY = 1e-2
 SFT_GRAD_CLIP = 1.0
 SFT_HUBER_BETA = 1.0
@@ -1005,7 +1001,7 @@ def run_posttrain_one_task(
     gpu_id: int,
     fold_name: str,
     seed: int,
-    ssl_step: int,
+    ssl_ep: int,
     ckpt_path: Optional[str],
     seq_len: int,
 ):
@@ -1020,13 +1016,13 @@ def run_posttrain_one_task(
         f"seqlen_{seq_len}",
         fold_name,
         f"seed{seed}",
-        f"ssl_step{ssl_step:06d}",
+        f"ssl_ep{ssl_ep:03d}",
     )
     Path(run_dir).mkdir(parents=True, exist_ok=True)
     _log = make_run_logger(os.path.join(run_dir, "run.log"))
 
     _log(
-        f"[TASK START] gpu={gpu_id} fold={fold_name} seed={seed} ssl_step={ssl_step:06d} seq_len={seq_len}"
+        f"[TASK START] gpu={gpu_id} fold={fold_name} seed={seed} ssl_ep={ssl_ep:03d} seq_len={seq_len}"
     )
     _log(
         f"device={device} torch={torch.__version__} cuda={torch.version.cuda if torch.cuda.is_available() else None}"
@@ -1127,10 +1123,10 @@ def run_posttrain_one_task(
     )
     init_model_for_training(model)
 
-    # load SSL if ssl_step>0 (wait for checkpoint if not exists)
-    if ssl_step > 0:
+    # load SSL if ssl_ep>0 (wait for checkpoint if not exists)
+    if ssl_ep > 0:
         if ckpt_path is None:
-            raise RuntimeError("ssl_step>0 but ckpt_path is None")
+            raise RuntimeError("ssl_ep>0 but ckpt_path is None")
 
         wait_start = time.time()
         max_wait_sec = CKPT_MAX_WAIT_HOURS * 3600
@@ -1161,7 +1157,7 @@ def run_posttrain_one_task(
         _log(f"[LOAD] Loading SSL checkpoint: {actual_ckpt_path}")
         load_ssl_into_model_trainonly_revin_scale(model, actual_ckpt_path)
     else:
-        _log("[INFO] ssl_step=0 => training from scratch (no SSL load)")
+        _log("[INFO] ssl_ep=0 => training from scratch (no SSL load)")
 
     model = model.to(device)
 
@@ -1172,38 +1168,40 @@ def run_posttrain_one_task(
         except Exception as e:
             _log(f"[compile] FAILED -> eager. err={e}")
 
-    # Differential learning rates (constant LR, no scheduler)
+    # Differential learning rates: pretrained parts use lower LR, new layers use higher LR
     opt = torch.optim.AdamW(
         [
-            {"params": model.encoder.parameters(), "lr": SFT_LR_ENCODER},
-            {"params": model.revin.parameters(), "lr": SFT_LR_ENCODER},
-            {"params": model.y_head.parameters(), "lr": SFT_LR_HEAD},
-            {"params": model.scale_gate.parameters(), "lr": SFT_LR_HEAD},
+            {"params": model.encoder.parameters(), "lr": 1e-5},
+            {"params": model.revin.parameters(), "lr": 1e-5},
+            {"params": model.y_head.parameters(), "lr": SFT_LR},
+            {"params": model.scale_gate.parameters(), "lr": SFT_LR},
         ],
         weight_decay=SFT_WEIGHT_DECAY,
     )
     use_scaler = _need_grad_scaler(SFT_USE_AMP, device, AMP_DTYPE)
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
-    n_batches_sft = (len(train_ds) + SFT_BATCH_SIZE - 1) // SFT_BATCH_SIZE
-    _log(
-        f"SFT budget: {SFT_TARGET_STEPS} steps, eval every {SFT_EVAL_EVERY_STEPS} steps "
-        f"({n_batches_sft} batches/data-pass)"
+    warmup_epochs = 3
+    scheduler = SequentialLR(
+        opt,
+        schedulers=[
+            LinearLR(opt, start_factor=0.01, total_iters=warmup_epochs),
+            CosineAnnealingLR(opt, T_max=SFT_EPOCHS - warmup_epochs, eta_min=1e-7),
+        ],
+        milestones=[warmup_epochs],
     )
 
-    step_csv = os.path.join(run_dir, "sft_step_log.csv")
-    if not os.path.exists(step_csv):
-        with open(step_csv, "w", encoding="utf-8") as f:
+    epoch_csv = os.path.join(run_dir, "sft_epoch_log.csv")
+    if not os.path.exists(epoch_csv):
+        with open(epoch_csv, "w", encoding="utf-8") as f:
             f.write(
-                "fold,seed,ssl_step,sft_step,train_loss,eval_loss,eval_corr,gpu,seq_len\n"
+                "fold,seed,ssl_ep,sft_ep,train_loss,eval_loss,eval_corr,gpu,seq_len\n"
             )
 
     last_path = os.path.join(run_dir, "last.pt")
     best_path = os.path.join(run_dir, "best.pt")
-    sft_step = 0
+    start_ep = 1
     best_corr = -2.0
-    next_eval_step = SFT_EVAL_EVERY_STEPS
-    data_epoch = 0
 
     # Try to find checkpoint to resume from
     resume_path = None
@@ -1211,40 +1209,46 @@ def run_posttrain_one_task(
         resume_path = last_path
         _log(f"[RESUME] Found last.pt -> resume: {last_path}")
     else:
-        step_files = sorted(glob.glob(os.path.join(run_dir, "step*.pt")))
-        if step_files:
-            resume_path = step_files[-1]
-            _log(f"[RESUME] No last.pt, using latest step checkpoint: {resume_path}")
+        import glob
+
+        ep_files = sorted(glob.glob(os.path.join(run_dir, "ep*.pt")))
+        if ep_files:
+            resume_path = ep_files[-1]
+            _log(f"[RESUME] No last.pt, using max epoch checkpoint: {resume_path}")
 
     if resume_path is not None:
         meta = load_last_ckpt(resume_path, _get_orig_model(model), opt, scaler)
-        sft_step = int(meta.get("sft_step", meta.get("sft_global_step", 0)))
+        start_ep = int(meta.get("epoch", 0)) + 1
         best_corr = float(meta.get("best_corr", -2.0))
-        data_epoch = int(meta.get("data_epoch", 0))
-        next_eval_step = ((sft_step // SFT_EVAL_EVERY_STEPS) + 1) * SFT_EVAL_EVERY_STEPS
-        _log(f"[RESUME] sft_step={sft_step}, best_corr={best_corr:.6f}, data_epoch={data_epoch}")
+        _log(f"[RESUME] start_ep={start_ep}, best_corr={best_corr:.6f}")
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * 0.01
+        for _ in range(1, start_ep):
+            scheduler.step()
+        _log(
+            f"[RESUME] Advanced scheduler to epoch {start_ep}, lr={scheduler.get_last_lr()}"
+        )
 
-    if sft_step >= SFT_TARGET_STEPS:
-        _log(f"[SKIP] Already finished (step={sft_step} >= {SFT_TARGET_STEPS})")
+    if start_ep > SFT_EPOCHS:
+        _log(f"[SKIP] Already finished (start_ep={start_ep} > SFT_EPOCHS={SFT_EPOCHS})")
         del model, opt, scaler
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
         return
 
-    # Training loop — epochs are just a data-shuffling mechanism
-    running_loss = torch.zeros(1, device=device)
-    running_wsum = torch.zeros(1, device=device)
-
-    while sft_step < SFT_TARGET_STEPS:
-        data_epoch += 1
+    for ep in range(start_ep, SFT_EPOCHS + 1):
         model.train()
 
+        # Flat shuffle: mix samples across all days into real batch_size chunks
         shuffle_gen = torch.Generator(device=device)
-        shuffle_gen.manual_seed(seed * 7 + data_epoch)
+        shuffle_gen.manual_seed(seed * 7 + ep)
         perm = torch.randperm(len(train_ds), device=device, generator=shuffle_gen)
         batch_indices_list = list(perm.split(SFT_BATCH_SIZE))
         del perm
+
+        running_loss = torch.zeros(1, device=device)
+        running_wsum = torch.zeros(1, device=device)
 
         for indices in batch_indices_list:
             x, y, w, pad_mask, day_idx, t_idx = train_ds.get_batch(indices)
@@ -1270,74 +1274,63 @@ def run_posttrain_one_task(
             ww = w.detach().float().clamp_min(0.0)
             running_loss += loss.detach() * ww.sum()
             running_wsum += ww.sum()
-            sft_step += 1
-
-            # Eval + checkpoint at step boundaries
-            is_final = sft_step >= SFT_TARGET_STEPS
-            if sft_step >= next_eval_step or is_final:
-                train_loss = float((running_loss / running_wsum.clamp_min(1e-12)).item())
-
-                if eval_ds is not None:
-                    model.eval()
-                    met = evaluate_gpu(
-                        model, eval_ds, device, huber_beta=SFT_HUBER_BETA,
-                        batch_size=SFT_BATCH_SIZE,
-                    )
-                    eval_loss = met["loss_huber_w"]
-                    eval_corr = met["corr_overall_w"]
-                    model.train()
-                else:
-                    eval_loss = float("nan")
-                    eval_corr = float("nan")
-
-                _log(
-                    f"[EVAL] fold={fold_name} ssl_step={ssl_step:06d} step={sft_step}/{SFT_TARGET_STEPS} gpu={gpu_id} "
-                    f"TrL={train_loss:.6f} EvL={eval_loss:.6f} Corr={eval_corr:.6f}"
-                )
-
-                with open(step_csv, "a", encoding="utf-8") as f:
-                    f.write(
-                        f"{fold_name},{seed},{ssl_step},{sft_step},{train_loss},{eval_loss},{eval_corr},{gpu_id},{seq_len}\n"
-                    )
-
-                meta = {
-                    "fold_name": fold_name,
-                    "seed": seed,
-                    "ssl_step": int(ssl_step),
-                    "sft_step": sft_step,
-                    "data_epoch": data_epoch,
-                    "best_corr": float(best_corr),
-                    "gpu_id": int(gpu_id),
-                    "ckpt_path": ckpt_path if ckpt_path is not None else "",
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "use_revin": USE_REVIN,
-                    "scale_injection": True,
-                    "log_transform": True,
-                    "has_categorical": False,
-                    "seq_len": seq_len,
-                }
-                save_ckpt(os.path.join(run_dir, f"step{sft_step:06d}.pt"), model, opt, scaler, meta)
-                save_ckpt(last_path, model, opt, scaler, meta)
-
-                if eval_ds is not None and eval_corr > best_corr:
-                    best_corr = float(eval_corr)
-                    meta["best_corr"] = float(best_corr)
-                    save_ckpt(best_path, model, opt, scaler, meta)
-                    _log(
-                        f"[BEST] fold={fold_name} ssl_step={ssl_step:06d} best_corr={best_corr:.6f} @ step={sft_step}"
-                    )
-
-                next_eval_step = ((sft_step // SFT_EVAL_EVERY_STEPS) + 1) * SFT_EVAL_EVERY_STEPS
-                running_loss = torch.zeros(1, device=device)
-                running_wsum = torch.zeros(1, device=device)
-
-            if is_final:
-                break
 
         del batch_indices_list
+        train_loss = float((running_loss / running_wsum.clamp_min(1e-12)).item())
+
+        if eval_ds is not None:
+            met = evaluate_gpu(
+                model, eval_ds, device, huber_beta=SFT_HUBER_BETA,
+                batch_size=SFT_BATCH_SIZE,
+            )
+            eval_loss = met["loss_huber_w"]
+            eval_corr = met["corr_overall_w"]
+        else:
+            eval_loss = float("nan")
+            eval_corr = float("nan")
+
+        _log(
+            f"[EPOCH] fold={fold_name} ssl_ep={ssl_ep:03d} sft_ep={ep:03d} gpu={gpu_id} "
+            f"TrL={train_loss:.6f} EvL={eval_loss:.6f} Corr={eval_corr:.6f}"
+        )
+
+        with open(epoch_csv, "a", encoding="utf-8") as f:
+            f.write(
+                f"{fold_name},{seed},{ssl_ep},{ep},{train_loss},{eval_loss},{eval_corr},{gpu_id},{seq_len}\n"
+            )
+
+        meta = {
+            "fold_name": fold_name,
+            "seed": seed,
+            "ssl_ep": int(ssl_ep),
+            "epoch": int(ep),
+            "best_corr": float(best_corr),
+            "gpu_id": int(gpu_id),
+            "ckpt_path": ckpt_path if ckpt_path is not None else "",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "use_revin": USE_REVIN,
+            "scale_injection": True,
+            "log_transform": True,
+            "has_categorical": False,
+            "seq_len": seq_len,
+        }
+        save_ckpt(os.path.join(run_dir, f"ep{ep:03d}.pt"), model, opt, scaler, meta)
+        save_ckpt(last_path, model, opt, scaler, meta)
+
+        if eval_ds is not None and eval_corr > best_corr:
+            best_corr = float(eval_corr)
+            meta["best_corr"] = float(best_corr)
+            save_ckpt(best_path, model, opt, scaler, meta)
+            _log(
+                f"[BEST] fold={fold_name} ssl_ep={ssl_ep:03d} best_corr={best_corr:.6f} @ sft_ep={ep:03d}"
+            )
+
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()
+        _log(f"[LR] epoch={ep:03d} lr={current_lr}")
 
     _log(
-        f"[TASK DONE] fold={fold_name} ssl_step={ssl_step:06d} finished steps={sft_step}/{SFT_TARGET_STEPS}"
+        f"[TASK DONE] fold={fold_name} ssl_ep={ssl_ep:03d} finished SFT_EPOCHS={SFT_EPOCHS}"
     )
 
     del model, opt, scaler
@@ -1347,26 +1340,26 @@ def run_posttrain_one_task(
 
 
 # ----------------------------
-# 16) Discover manifests + build task list (support ssl_step=0)
+# 16) Discover manifests + build task list (support ssl_ep=0)
 # ----------------------------
 @dataclass(frozen=True)
 class Task:
     fold_name: str
     seed: int
-    ssl_step: int
+    ssl_ep: int
     ckpt_path: Optional[str]
     seq_len: int
 
 
 def is_task_completed(
-    fold_name: str, seed: int, ssl_step: int, seq_len: int
+    fold_name: str, seed: int, ssl_ep: int, seq_len: int
 ) -> Tuple[bool, int]:
     run_dir = os.path.join(
         SFT_OUT_DIR,
         f"seqlen_{seq_len}",
         fold_name,
         f"seed{seed}",
-        f"ssl_step{ssl_step:06d}",
+        f"ssl_ep{ssl_ep:03d}",
     )
     last_path = os.path.join(run_dir, "last.pt")
 
@@ -1376,10 +1369,10 @@ def is_task_completed(
     try:
         payload = torch.load(last_path, map_location="cpu")
         meta = payload.get("meta", {})
-        step = int(meta.get("sft_step", meta.get("sft_global_step", 0)))
-        if step >= SFT_TARGET_STEPS:
-            return True, step
-        return False, step
+        epoch = int(meta.get("epoch", 0))
+        if epoch >= SFT_EPOCHS:
+            return True, epoch
+        return False, epoch
     except Exception as e:
         master_log(f"[WARN] Failed to load {last_path}: {e}")
         return False, 0
@@ -1399,25 +1392,25 @@ def load_tasks(seeds: List[int]) -> List[Task]:
             for y in [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
         ]
 
-    for seq_len in SSL_STEPS_PER_SEQLEN:
+    for seq_len in SSL_EPOCHS_PER_SEQLEN:
         ssl_ckpt_dir = os.path.join(SSL_MANIFEST_DIR, f"seqlen_{seq_len}")
-        ssl_steps_for_sl = SSL_STEPS_PER_SEQLEN[seq_len]
+        ssl_epochs_for_sl = SSL_EPOCHS_PER_SEQLEN[seq_len]
         for seed in seeds:
             for fold_name in folds_to_process:
-                for ssl_step in ssl_steps_for_sl:
-                    ssl_step = int(ssl_step)
+                for ssl_ep in ssl_epochs_for_sl:
+                    ssl_ep = int(ssl_ep)
 
-                    if ssl_step == 0:
+                    if ssl_ep == 0:
                         task = Task(
                             fold_name=fold_name,
                             seed=seed,
-                            ssl_step=0,
+                            ssl_ep=0,
                             ckpt_path=None,
                             seq_len=seq_len,
                         )
                     else:
                         ckpt_pattern = (
-                            f"ssl_{fold_name}_seed{seed}_step{ssl_step:06d}_train*.pt"
+                            f"ssl_{fold_name}_seed{seed}_ep{ssl_ep:03d}_train*.pt"
                         )
                         ckpt_matches = sorted(Path(ssl_ckpt_dir).glob(ckpt_pattern))
 
@@ -1426,30 +1419,30 @@ def load_tasks(seeds: List[int]) -> List[Task]:
                         else:
                             ckpt_path = os.path.join(
                                 ssl_ckpt_dir,
-                                f"ssl_{fold_name}_seed{seed}_step{ssl_step:06d}_train*.pt",
+                                f"ssl_{fold_name}_seed{seed}_ep{ssl_ep:03d}_train*.pt",
                             )
                             master_log(
-                                f"[INFO] seqlen={seq_len} seed={seed} fold={fold_name} ssl_step={ssl_step} ckpt not found yet, will wait"
+                                f"[INFO] seqlen={seq_len} seed={seed} fold={fold_name} ssl_ep={ssl_ep} ckpt not found yet, will wait"
                             )
 
                         task = Task(
                             fold_name=fold_name,
                             seed=seed,
-                            ssl_step=ssl_step,
+                            ssl_ep=ssl_ep,
                             ckpt_path=ckpt_path,
                             seq_len=seq_len,
                         )
 
-                    is_done, current_step = is_task_completed(
-                        fold_name, seed, ssl_step, seq_len
+                    is_done, current_ep = is_task_completed(
+                        fold_name, seed, ssl_ep, seq_len
                     )
                     if is_done:
                         completed_tasks.append(
-                            (fold_name, seed, ssl_step, current_step, seq_len)
+                            (fold_name, seed, ssl_ep, current_ep, seq_len)
                         )
-                    elif current_step > 0:
+                    elif current_ep > 0:
                         in_progress_tasks.append(
-                            (fold_name, seed, ssl_step, current_step, seq_len)
+                            (fold_name, seed, ssl_ep, current_ep, seq_len)
                         )
                         pending_tasks.append(task)
                     else:
@@ -1458,7 +1451,7 @@ def load_tasks(seeds: List[int]) -> List[Task]:
 
     master_log("=" * 70)
     master_log(
-        f"Task Status Summary (seeds={seeds}, seq_lens={list(SSL_STEPS_PER_SEQLEN)}) [SEQ_LEN Ablation Post-train v3 GPU-Resident]"
+        f"Task Status Summary (seeds={seeds}, seq_lens={list(SSL_EPOCHS_PER_SEQLEN)}) [SEQ_LEN Ablation Post-train v3 GPU-Resident]"
     )
     master_log("=" * 70)
     master_log(f"Total tasks discovered: {len(all_tasks)}")
@@ -1469,18 +1462,18 @@ def load_tasks(seeds: List[int]) -> List[Task]:
 
     if completed_tasks:
         master_log("\n[COMPLETED TASKS]")
-        for fold_name, seed, ssl_step, step, seq_len in completed_tasks[:10]:
+        for fold_name, seed, ssl_ep, epoch, seq_len in completed_tasks[:10]:
             master_log(
-                f"  done: seqlen={seq_len} {fold_name} seed={seed} ssl_step={ssl_step:06d} (finished at step {step})"
+                f"  done: seqlen={seq_len} {fold_name} seed={seed} ssl_ep={ssl_ep:03d} (finished at epoch {epoch})"
             )
         if len(completed_tasks) > 10:
             master_log(f"  ... and {len(completed_tasks) - 10} more")
 
     if in_progress_tasks:
         master_log("\n[IN PROGRESS TASKS - will resume]")
-        for fold_name, seed, ssl_step, current_step, seq_len in in_progress_tasks:
+        for fold_name, seed, ssl_ep, current_ep, seq_len in in_progress_tasks:
             master_log(
-                f"  resuming: seqlen={seq_len} {fold_name} seed={seed} ssl_step={ssl_step:06d} (at step {current_step})"
+                f"  resuming: seqlen={seq_len} {fold_name} seed={seed} ssl_ep={ssl_ep:03d} (at epoch {current_ep}/{SFT_EPOCHS})"
             )
 
     master_log("=" * 70)
@@ -1553,13 +1546,13 @@ def _mp_worker_fn(
         task = Task(
             fold_name=task_tuple[0],
             seed=task_tuple[1],
-            ssl_step=task_tuple[2],
+            ssl_ep=task_tuple[2],
             ckpt_path=task_tuple[3],
             seq_len=task_tuple[4],
         )
 
         resolved_ckpt_path = task.ckpt_path
-        if task.ssl_step > 0 and task.ckpt_path is not None:
+        if task.ssl_ep > 0 and task.ckpt_path is not None:
             available, resolved = is_ckpt_available(task.ckpt_path)
             if not available:
                 task_queue.put(task_tuple)
@@ -1581,13 +1574,13 @@ def _mp_worker_fn(
         try:
             master_log(
                 f"[WORKER {rank}] starting: seqlen={task.seq_len} fold={task.fold_name} seed={task.seed} "
-                f"ssl_step={task.ssl_step} (done={tasks_done.value}/{total_count})"
+                f"ssl_ep={task.ssl_ep} (done={tasks_done.value}/{total_count})"
             )
             run_posttrain_one_task(
                 gpu_id=gpu_id,
                 fold_name=task.fold_name,
                 seed=task.seed,
-                ssl_step=task.ssl_step,
+                ssl_ep=task.ssl_ep,
                 ckpt_path=resolved_ckpt_path,
                 seq_len=task.seq_len,
             )
@@ -1596,13 +1589,13 @@ def _mp_worker_fn(
             try:
                 master_log(
                     f"[MP-ERROR] rank={rank} gpu={gpu_id} seqlen={task.seq_len} fold={task.fold_name} "
-                    f"seed={task.seed} ssl_step={task.ssl_step}: {e}"
+                    f"seed={task.seed} ssl_ep={task.ssl_ep}: {e}"
                 )
                 master_log(traceback.format_exc())
             except Exception:
                 print(
                     f"[MP-ERROR] rank={rank} gpu={gpu_id} seqlen={task.seq_len} fold={task.fold_name} "
-                    f"seed={task.seed} ssl_step={task.ssl_step}: {e}",
+                    f"seed={task.seed} ssl_ep={task.ssl_ep}: {e}",
                     flush=True,
                 )
                 print(traceback.format_exc(), flush=True)
@@ -1623,7 +1616,7 @@ def run_all_tasks_multiprocess_pool(tasks: List[Task]):
     tasks_done = ctx.Value("i", 0)
 
     for t in tasks:
-        task_queue.put((t.fold_name, t.seed, t.ssl_step, t.ckpt_path, t.seq_len))
+        task_queue.put((t.fold_name, t.seed, t.ssl_ep, t.ckpt_path, t.seq_len))
 
     total_count = len(tasks)
 
@@ -1653,20 +1646,20 @@ def run_all_tasks_multiprocess_pool(tasks: List[Task]):
 def main():
     tasks = load_tasks(SEEDS_TO_RUN)
     master_log(f"Discovered tasks: {len(tasks)} (seeds={SEEDS_TO_RUN})")
-    master_log(f"SSL_STEPS_PER_SEQLEN={SSL_STEPS_PER_SEQLEN}")
+    master_log(f"SSL_EPOCHS_PER_SEQLEN={SSL_EPOCHS_PER_SEQLEN}")
     master_log(f"Example tasks: {tasks[:3]}")
 
     master_log(
-        f"RUN: seeds={SEEDS_TO_RUN} seq_lens={list(SSL_STEPS_PER_SEQLEN)} GPUs={GPU_IDS} workers={N_WORKERS} cpu_threads/worker={CPU_THREADS_PER_WORKER}"
+        f"RUN: seeds={SEEDS_TO_RUN} seq_lens={list(SSL_EPOCHS_PER_SEQLEN)} GPUs={GPU_IDS} workers={N_WORKERS} cpu_threads/worker={CPU_THREADS_PER_WORKER}"
     )
     master_log(
-        f"SFT_TARGET_STEPS={SFT_TARGET_STEPS} eval_every={SFT_EVAL_EVERY_STEPS} SFT_BS={SFT_BATCH_SIZE} LR_enc={SFT_LR_ENCODER} LR_head={SFT_LR_HEAD} AMP={SFT_USE_AMP}/{AMP_DTYPE} compile={USE_TORCH_COMPILE}"
+        f"SFT_EPOCHS={SFT_EPOCHS} SFT_BS={SFT_BATCH_SIZE} AMP={SFT_USE_AMP}/{AMP_DTYPE} compile={USE_TORCH_COMPILE}"
     )
     master_log(
         f"USE_REVIN={USE_REVIN} REVIN_AFFINE={REVIN_AFFINE} GATING=Multiplicative LOG_TRANSFORM=True NO_CAT=True PADDING_MASK=True"
     )
     master_log("BIG Transformer: d_model=128, nhead=4, num_layers=3, dim_ff=256")
-    master_log(f"Differential LR (pretrained={SFT_LR_ENCODER}, new={SFT_LR_HEAD}), WD={SFT_WEIGHT_DECAY}, constant LR")
+    master_log("Differential LR (pretrained=1e-5, new=3e-5), WD=0.01, Warmup+Cosine")
     master_log("GPU-RESIDENT DATA: all data on GPU, vectorized batch construction")
     master_log(f"Outputs -> {os.path.abspath(SFT_OUT_DIR)}")
     master_log(f"Master log -> {os.path.abspath(MASTER_LOG_PATH)}")
