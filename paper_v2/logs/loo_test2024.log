@@ -1,0 +1,123 @@
+/home/ql84/Transformer/eval_ensemble.py:143: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+/home/ql84/Transformer/eval_ensemble.py:143: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+Device: cuda:0  feature_dim: 50  seqlens: [3, 5, 8, 10, 20, 30]
+DEV     (7): ['Fold_2015-2017_train_SSL', 'Fold_2015-2018_train_SSL', 'Fold_2015-2019_train_SSL', 'Fold_2015-2020_train_SSL', 'Fold_2015-2021_train_SSL', 'Fold_2015-2022_train_SSL', 'Fold_2015-2024_train_SSL'] → [2018, 2019, 2020, 2021, 2022, 2023, 2025]
+HOLDOUT (1): ['Fold_2015-2023_train_SSL'] → [2024]
+
+[STEP 1] Picking per-seqlen deploy step (tol=5.0bps, plateau_hi)
+  sl= 3  n_steps= 70  chosen=550000 (min_regret=0.0347%  tol=5.0bps)  base=./sft_posttrain_v3_1
+  sl= 5  n_steps= 60  chosen=450000 (min_regret=0.0447%  tol=5.0bps)  base=./sft_posttrain_v3_1
+  sl= 8  n_steps= 50  chosen=350000 (min_regret=0.0571%  tol=5.0bps)  base=./sft_posttrain_v3_1
+  sl=10  n_steps= 45  chosen=290000 (min_regret=0.0631%  tol=5.0bps)  base=./sft_posttrain_v3_1
+  sl=20  n_steps= 35  chosen=130000 (min_regret=0.0784%  tol=5.0bps)  base=./sft_posttrain_v3
+  sl=30  n_steps= 25  chosen= 80000 (min_regret=0.0783%  tol=5.0bps)  base=./sft_posttrain_v3
+
+[STEP 2] DEV inference + ensemble search
+  [year 2018]  fold=Fold_2015-2017_train_SSL
+    sl= 3  n=  3486937  IC=+3.0463%
+    sl= 5  n=  3486937  IC=+3.9822%
+    sl= 8  n=  3486937  IC=+4.5918%
+    sl=10  n=  3486937  IC=+4.7778%
+    sl=20  n=  3486937  IC=+5.2273%
+    sl=30  n=  3486937  IC=+5.2172%
+  [year 2019]  fold=Fold_2015-2018_train_SSL
+    sl= 3  n=  3932049  IC=+3.0204%
+    sl= 5  n=  3932049  IC=+3.6915%
+    sl= 8  n=  3932049  IC=+4.2116%
+    sl=10  n=  3932049  IC=+4.3823%
+    sl=20  n=  3932049  IC=+5.1783%
+    sl=30  n=  3932049  IC=+5.4449%
+  [year 2020]  fold=Fold_2015-2019_train_SSL
+    sl= 3  n=  4087410  IC=+3.4709%
+    sl= 5  n=  4087410  IC=+4.4453%
+    sl= 8  n=  4087410  IC=+4.8224%
+    sl=10  n=  4087410  IC=+4.9663%
+    sl=20  n=  4087410  IC=+5.6013%
+    sl=30  n=  4087410  IC=+5.8371%
+  [year 2021]  fold=Fold_2015-2020_train_SSL
+    sl= 3  n=  4838721  IC=+2.1392%
+    sl= 5  n=  4838721  IC=+2.6924%
+    sl= 8  n=  4838721  IC=+3.0090%
+    sl=10  n=  4838721  IC=+2.9717%
+    sl=20  n=  4838721  IC=+3.1465%
+    sl=30  n=  4838721  IC=+3.3534%
+  [year 2022]  fold=Fold_2015-2021_train_SSL
+    sl= 3  n=  4879856  IC=+1.8189%
+    sl= 5  n=  4879856  IC=+2.2485%
+    sl= 8  n=  4879856  IC=+2.3224%
+    sl=10  n=  4879856  IC=+2.3474%
+    sl=20  n=  4879856  IC=+2.6638%
+    sl=30  n=  4879856  IC=+2.9024%
+  [year 2023]  fold=Fold_2015-2022_train_SSL
+    sl= 3  n=  4893656  IC=+1.6842%
+    sl= 5  n=  4893656  IC=+1.8644%
+    sl= 8  n=  4893656  IC=+1.8521%
+    sl=10  n=  4893656  IC=+1.9426%
+    sl=20  n=  4893656  IC=+2.2577%
+    sl=30  n=  4893656  IC=+2.5078%
+  [year 2025]  fold=Fold_2015-2024_train_SSL
+    sl= 3  n=  4903575  IC=+1.7231%
+    sl= 5  n=  4903575  IC=+1.9436%
+    sl= 8  n=  4903575  IC=+1.8155%
+    sl=10  n=  4903575  IC=+1.8416%
+    sl=20  n=  4903575  IC=+1.6552%
+    sl=30  n=  4903575  IC=+1.5667%
+
+  Top 20 DEV ensembles by avg IC:
+  Rank                        Combination      2018      2019      2020      2021      2022      2023      2025       AVG       MIN
+     1             sl3+sl5+sl10+sl20+sl30    6.2177    5.8221    6.3288    3.6180    3.0349    2.6027    2.1375    4.2517    2.1375
+     2                  sl3+sl8+sl20+sl30    6.2011    5.8934    6.3301    3.6340    3.0393    2.6016    2.0409    4.2486    2.0409
+     3                 sl5+sl10+sl20+sl30    6.2406    5.8573    6.3412    3.6175    3.0307    2.5754    2.0551    4.2454    2.0551
+     4                  sl5+sl8+sl20+sl30    6.2257    5.8452    6.3305    3.6369    3.0343    2.5644    2.0538    4.2415    2.0538
+     5              sl3+sl5+sl8+sl20+sl30    6.1904    5.7986    6.3055    3.6282    3.0320    2.5885    2.1321    4.2393    2.1321
+     6                 sl3+sl10+sl20+sl30    6.1884    5.8826    6.3148    3.5994    3.0256    2.6038    2.0349    4.2357    2.0349
+     7                  sl3+sl5+sl20+sl30    6.0886    5.8278    6.3066    3.5956    3.0669    2.6519    2.0982    4.2337    2.0982
+     8                      sl5+sl20+sl30    6.0950    5.8701    6.3240    3.5939    3.0674    2.6233    1.9862    4.2228    1.9862
+     9             sl3+sl8+sl10+sl20+sl30    6.2250    5.8144    6.2796    3.6148    2.9876    2.5422    2.0712    4.2193    2.0712
+    10         sl3+sl5+sl8+sl10+sl20+sl30    6.2051    5.7398    6.2636    3.6104    2.9855    2.5361    2.1394    4.2114    2.1394
+    11             sl5+sl8+sl10+sl20+sl30    6.2276    5.7662    6.2710    3.6111    2.9793    2.5092    2.0741    4.2055    2.0741
+    12                      sl8+sl20+sl30    6.1569    5.8829    6.2911    3.6057    3.0089    2.5423    1.9058    4.1991    1.9058
+    13                 sl8+sl10+sl20+sl30    6.1989    5.8052    6.2461    3.5921    2.9603    2.4926    1.9710    4.1809    1.9710
+    14                     sl10+sl20+sl30    6.1194    5.8490    6.2514    3.5539    2.9831    2.5373    1.8928    4.1696    1.8928
+    15                      sl5+sl10+sl30    6.0426    5.6559    6.2152    3.6007    3.0103    2.5501    2.1035    4.1683    2.1035
+    16                      sl3+sl20+sl30    5.9514    5.8473    6.2275    3.5332    3.0325    2.6384    1.9301    4.1658    1.9301
+    17                      sl3+sl10+sl30    5.9845    5.6940    6.1945    3.5900    3.0127    2.5964    2.0875    4.1656    2.0875
+    18                       sl3+sl8+sl30    5.9468    5.6619    6.1633    3.6130    3.0141    2.5755    2.0812    4.1508    2.0812
+    19                  sl3+sl5+sl10+sl30    5.9742    5.5717    6.1530    3.5723    2.9925    2.5624    2.1833    4.1442    2.1833
+    20                       sl5+sl8+sl30    5.9632    5.5897    6.1433    3.5995    2.9952    2.5157    2.0858    4.1275    2.0858
+
+[STEP 3] HOLDOUT inference + scoring top-20 DEV combos
+  [year 2024]  fold=Fold_2015-2023_train_SSL
+    sl= 3  n=  4885460  IC=+1.7229%
+    sl= 5  n=  4885460  IC=+2.0918%
+    sl= 8  n=  4885460  IC=+2.1659%
+    sl=10  n=  4885460  IC=+2.2517%
+    sl=20  n=  4885460  IC=+2.1130%
+    sl=30  n=  4885460  IC=+1.8483%
+
+  DEV-selected ensembles on HOLDOUT (DEV rank order):
+  Rank                        Combination    DEV_avg    DEV_min     HO_avg     HO_min
+     1             sl3+sl5+sl10+sl20+sl30     4.2517     2.1375     2.5042     2.5042
+     2                  sl3+sl8+sl20+sl30     4.2486     2.0409     2.4196     2.4196
+     3                 sl5+sl10+sl20+sl30     4.2454     2.0551     2.4584     2.4584
+     4                  sl5+sl8+sl20+sl30     4.2415     2.0538     2.4410     2.4410
+     5              sl3+sl5+sl8+sl20+sl30     4.2393     2.1321     2.4832     2.4832
+     6                 sl3+sl10+sl20+sl30     4.2357     2.0349     2.4302     2.4302
+     7                  sl3+sl5+sl20+sl30     4.2337     2.0982     2.4244     2.4244
+     8                      sl5+sl20+sl30     4.2228     1.9862     2.3539     2.3539
+     9             sl3+sl8+sl10+sl20+sl30     4.2193     2.0712     2.4742     2.4742
+    10         sl3+sl5+sl8+sl10+sl20+sl30     4.2114     2.1394     2.5153     2.5153
+    11             sl5+sl8+sl10+sl20+sl30     4.2055     2.0741     2.4810     2.4810
+    12                      sl8+sl20+sl30     4.1991     1.9058     2.3287     2.3287
+    13                 sl8+sl10+sl20+sl30     4.1809     1.9710     2.4111     2.4111
+    14                     sl10+sl20+sl30     4.1696     1.8928     2.3323     2.3323
+    15                      sl5+sl10+sl30     4.1683     2.1035     2.4513     2.4513
+    16                      sl3+sl20+sl30     4.1658     1.9301     2.2773     2.2773
+    17                      sl3+sl10+sl30     4.1656     2.0875     2.4204     2.4204
+    18                       sl3+sl8+sl30     4.1508     2.0812     2.3876     2.3876
+    19                  sl3+sl5+sl10+sl30     4.1442     2.1833     2.4880     2.4880
+    20                       sl5+sl8+sl30     4.1275     2.0858     2.4089     2.4089
+
+DONE
